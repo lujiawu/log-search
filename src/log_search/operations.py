@@ -29,8 +29,11 @@ def log_path():
 
 def source_fingerprint():
     digest = hashlib.sha256()
+    package = Path(__file__).parent
+    if not package.is_dir():
+        return None  # zipapp: the modules live inside the archive, not on the filesystem
     try:
-        for path in sorted(Path(__file__).parent.glob("*.py")):
+        for path in sorted(package.glob("*.py")):
             digest.update(path.name.encode("utf-8"))
             digest.update(path.read_bytes())
     except OSError:

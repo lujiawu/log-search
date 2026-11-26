@@ -20,6 +20,16 @@ class AuthenticationRequired(RuntimeError):
     pass
 
 
+def worker_source():
+    """Read the worker text from a repo tree or a zipapp archive; pathlib cannot open the latter."""
+    return worker.__loader__.get_source(worker.__name__).encode("utf-8")
+
+
+# Repo src/ directory or the .pyz itself: sys.path entry a child process can import from.
+ARCHIVE = str(Path(worker.__file__).resolve().parents[1])
+LOCAL_WORKER = "import sys; sys.path.insert(0, sys.argv[1]); from log_search.worker import main; sys.exit(main())"
+
+
 def validate_target(target):
     if not isinstance(target, str) or not target or target.startswith("-") or re.search(r"[\s\x00-\x1f]", target):
         raise ValueError("非法 SSH 目标")
@@ -132,7 +142,7 @@ class SshTransport:
         remote = "python3 -u -c " + shlex.quote(bootstrap)
         command = self.arguments(target) + ["-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", "ControlPath=" + self.socket(target), target, remote]
         process = await asyncio.create_subprocess_exec(*command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=worker.MAX_MESSAGE + 1, start_new_session=True)
-        source = Path(worker.__file__).read_bytes()
+        source = worker_source()
         process.stdin.write(str(len(source)).encode("ascii") + b"\n" + source)
         try:
             await asyncio.wait_for(process.stdin.drain(), 5)
@@ -162,4 +172,4 @@ class SshTransport:
 
 
 async def local_worker():
-    return await asyncio.create_subprocess_exec(sys.executable, "-u", str(Path(worker.__file__)), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=worker.MAX_MESSAGE + 1, start_new_session=True)
+    return await asyncio.create_subprocess_exec(sys.executable, "-u", "-c", LOCAL_WORKER, ARCHIVE, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, limit=worker.MAX_MESSAGE + 1, start_new_session=True)
