@@ -990,16 +990,19 @@ def hit_rows(path, kind, runtime, before):
         while assembled and not budget_hit:
             yield assembled.pop(0)
         if budget_hit:
+            # 缓冲越界只代表这个文件不再继续读，不代表本次结果作废：已抓到的命中必须照常走
+            # 下面的重读并发出，否则高频词查询会得到 0 条。停止时机由 _entry 的配额检查决定。
             for buffered in pending + assembled:
                 yield buffered
+            del pending[:]
+            del assembled[:]
             runtime.outcome = "limited"
-            runtime.stopped.set()
-            raise Stopped()
-        status = process.wait()
-        gzip_status = unzip.wait() if unzip else 0
-        if status not in (0, 1) or gzip_status != 0:
-            runtime.unreadable(path)
-            runtime.warning("gzip_error" if unzip else "rg_error", clean(bytes(errors).decode("utf-8", "replace")), path)
+        else:
+            status = process.wait()
+            gzip_status = unzip.wait() if unzip else 0
+            if status not in (0, 1) or gzip_status != 0:
+                runtime.unreadable(path)
+                runtime.warning("gzip_error" if unzip else "rg_error", clean(bytes(errors).decode("utf-8", "replace")), path)
         extract = set(rereread) if want_entries else set(expanded)
         covering = []
         if extract:

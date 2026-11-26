@@ -25,6 +25,17 @@ def run(root, **kwargs):
     return [event["entry"] for event in events if event["type"] == "entry"], events[-1], events
 
 
+def test_dense_hits_fill_the_limit_instead_of_returning_nothing(tmp_path):
+    """单文件命中数远超 max_entries 时必须取满配额返回，而不是把整批结果丢掉。"""
+    logs = tmp_path / "svc/logs/history"
+    logs.mkdir(parents=True)
+    line = "2026-01-01 10:00:%02d.000 [main] ERROR c.x.PropertyServiceImpl:202 - ### Error updating database. Cause: java.sql.SQLException TRACE\n"
+    (logs / "error.2026-01-01.13.log").write_text("".join(line % (index % 60) for index in range(5000)))
+    entries, done, _ = run(tmp_path)
+    assert done["outcome"] == "limited" and done["entries"] == 100
+    assert len(entries) == 100 and {entry["file"] for entry in entries} == {"svc/logs/history/error.2026-01-01.13.log"}
+
+
 def test_nul_business_rolling_gzip_and_multiline(logs):
     (logs / "app-alpha/logs/history/debug.1").write_bytes(b"[thread] 2026-01-01 10:00:00.001 ERROR TRACE\n at example.one\n\x00TRACE\x00\n2026-01-01 10:00:01 INFO next\n")
     with gzip.open(logs / "app-gamma/logs/history/no-extension", "wb") as output:
