@@ -21,11 +21,22 @@ python3 -m venv .venv
 .venv/bin/log-search --help
 ```
 
-仅安装基本包时 CLI 不需要 Textual。新工具被排除在产品部署 ZIP 外，不改变现有 Web、Bash wrapper 或 Compose 配置。可执行程序独立打包留到后续阶段。
+仅安装基本包时 CLI 不需要 Textual。新工具被排除在产品部署 ZIP 外，不改变现有 Web、Bash wrapper 或 Compose 配置。
+
+## 单文件分发
+
+```bash
+sh scripts/build.sh    # 产物 dist/log-search，约 2.6 MB
+```
+
+依赖全是纯 Python，打包不需要编译器。`scp` 到跳板机后 `chmod +x` 直接运行；目标机仍需 Python 3.10+ 及 rg、gzip、ssh。worker 源码改由 zipimport 读取，本机子进程用归档路径引导，两种形态（仓库目录 / 单文件）走同一套代码。
 
 ## CLI
 
 ```bash
+# 裸跑：只给查询值，自动补本机 + 当前目录 + 当天窗口，先回显等效命令再确认
+log-search --query 'TRACE'
+
 # 本机：部署根目录
 log-search search --local --root /srv/app-logs --query 'TRACE'
 
@@ -57,6 +68,12 @@ log-search context --local --root /srv/app-logs \
 log-search search --local --root /srv/app-logs --query 'TRACE' \
   --export /tmp/trace-results.jsonl
 ```
+
+裸跑时首词不是子命令就按 `search` 处理，缺什么补什么：`--local`、`--log-dir <当前目录绝对路径>`、当天 00:00 到次日 00:00 的 `--since/--until`。已给出 `--host`、`--root`/`--log-dir` 或任一界值时不再注入对应项（只给 `--since` 不会补上界）。远端裸跑不注入目录：本机路径对远端没有意义，仍要求显式 `--root`。当前目录是家目录或根目录时按参数错误拒绝。
+
+补过默认值就把等效命令和生效参数打到 stderr，交互终端下再问一次 `执行？ [Y/n]`；`-y` 或非 TTY（管道、脚本）不会被打断。回 `n` 以退出码 130 结束，屏幕上那行改完即可重跑。注意裸跑限**当天**，显式 `log-search search ...` 仍**不限时间**，查跨天事故要手写 `--since`。
+
+`--log-dir` 会递归该目录下全部子目录，不要求存在 `logs/` 层级，此时条目的服务名取该目录名。扫描结束后 stderr 追加一行扫描范围：选中目录、发现文件数、实际读取字节、跳过的符号链接。
 
 查询值必填，搜索前自动清理首尾空白，保留中间空格，之后精确字面量匹配；清理后为空则报错。可用 `--no-archives` 排除 gzip、`--include-unknown-time` 保留无法判断时间范围的条目、`--timeout 120` 调整时限、`--max-entries 2000` 调整结果上限。
 

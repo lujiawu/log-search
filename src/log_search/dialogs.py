@@ -1,7 +1,6 @@
 """Plain text editors for infrequent settings; keep the workbench for logs."""
 
 import asyncio
-from datetime import datetime, timedelta
 from pathlib import Path
 
 from textual import on
@@ -11,11 +10,6 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Label, RadioButton, RadioSet, SelectionList, Static, TextArea
 
 from .controller import request
-
-
-def today_time_range(now=None):
-    start = (now or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
-    return start.strftime("%Y-%m-%d %H:%M:%S"), (start + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_fields(text, keys, repeated=(), optional=()):

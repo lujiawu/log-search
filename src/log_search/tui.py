@@ -15,9 +15,9 @@ from textual.widgets import Button, DataTable, Input, Rule, Static, TextArea
 
 from .clipboard import copy_text
 from .config import load_preferences, save_preferences, ssh_config_path
-from .controller import Controller, request, sort_key
+from .controller import Controller, request, sort_key, today_time_range
 from .grouping import aggregate
-from .dialogs import EditorDialog, SettingsDialog, today_time_range
+from .dialogs import EditorDialog, SettingsDialog
 
 
 class LogTable(DataTable):

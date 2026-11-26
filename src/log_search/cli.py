@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import shlex
 import signal
 import sys
 from pathlib import Path
@@ -9,7 +10,7 @@ from rich.console import Console
 from rich.text import Text
 
 from .config import host_aliases, ssh_config_path
-from .controller import Controller, request, sort_key
+from .controller import Controller, request, sort_key, today_time_range
 from .export import export_task
 from .operations import OperationLog, log_path, read_records
 
@@ -61,6 +62,7 @@ def parser():
             command.add_argument("--expand-pattern", default="", help="命中行符合此正则时展开所属条目")
             command.add_argument("--no-exception-expansion", action="store_true")
             command.add_argument("--export", type=Path, help="保存本次已返回结果为 JSONL；拒绝覆盖")
+            command.add_argument("--yes", "-y", action="store_true", help="裸跑补默认值时跳过执行确认")
         elif name == "context":
             command.add_argument("--file", required=True)
             command.add_argument("--line", type=int, required=True)
@@ -98,6 +100,7 @@ async def run(args):
     if controller.operations.error:
         diagnostic.print(Text("操作日志不可用：" + controller.operations.error, style="yellow"))
     task = None
+    scope_directories = []
     loop = asyncio.get_running_loop()
     try:
         if args.interactive_auth and args.host:
@@ -117,6 +120,8 @@ async def run(args):
                 console.print(Text("能力检查通过：" + json.dumps(event["capabilities"], ensure_ascii=False)))
                 for directory in event["directories"]:
                     console.print(Text(directory))
+            elif event["type"] == "ready":
+                scope_directories = event["directories"]
             elif event["type"] == "logs":
                 for directory in event["directories"]:
                     console.print(Text("{} · {} 文件 · {:.1f} MiB".format(directory["path"], directory["files"], directory["bytes"] / 1048576)))
@@ -130,6 +135,9 @@ async def run(args):
                 display_entry(console, entry)
             done = task.done or {}
             diagnostic.print(Text("{} · {} 条目 · 范围{} · {}s".format(done.get("outcome", "failed"), done.get("entries", 0), "读取完整" if done.get("scope_complete") else "不完整", done.get("elapsed", "?"))))
+            if args.command == "search" and scope_directories:
+                shown = "、".join(scope_directories[:3]) + ("…共 {} 个".format(len(scope_directories)) if len(scope_directories) > 3 else "")
+                diagnostic.print(Text("扫描范围：{} · 发现 {} 文件 · 实际读取 {} MiB · 跳过符号链接 {}".format(shown, done.get("discovered", 0), round(done.get("bytes_read", 0) / 1048576, 1), done.get("skipped_links", 0))))
             if not done.get("content_complete", True):
                 diagnostic.print("部分条目预览已截断", style="yellow")
             if done.get("filter_file_dates"):
@@ -157,9 +165,52 @@ async def run(args):
         await controller.close()
 
 
+COMMANDS = ("search", "context", "check", "logs", "hosts", "diagnostics", "tui")
+
+
+def expand(argv):
+    """A bare --query run means: search this directory, today only. Nothing else is implied."""
+    if argv and (argv[0] in COMMANDS or argv[0].startswith("-h") or argv[0] == "--version"):
+        return argv
+    flags = {arg.split("=", 1)[0] for arg in argv}
+    result = ["search"]
+    local = not flags & {"--local", "--host"}
+    if local:
+        result.append("--local")
+    # A local working directory has no meaning on the remote host, so remote runs still need an explicit scope.
+    if local and not flags & {"--root", "--log-dir"}:
+        cwd = Path.cwd()
+        if cwd in (Path.home(), Path("/")):
+            raise ValueError("当前目录是家目录或根目录，请显式指定 --root 或 --log-dir")
+        result += ["--log-dir", str(cwd)]
+    if not flags & {"--since", "--until"}:
+        result += ["--since", today_time_range()[0], "--until", today_time_range()[1]]
+    return result + argv
+
+
+def preview(args, argv):
+    """Echo the resolved run so an adjusted repeat does not require reading argparse defaults."""
+    diagnostic = Console(stderr=True, highlight=False)
+    # sys.argv[0] is re-runnable for the installed script and the zipapp, but not for python -m.
+    launcher = "python3 -m log_search" if Path(sys.argv[0]).name == "__main__.py" else sys.argv[0]
+    diagnostic.print(Text("等效命令：" + " ".join(shlex.quote(part) for part in [launcher] + argv)), soft_wrap=True)
+    diagnostic.print(Text("生效参数：时间窗 {} ～ {} [起,止) · 上限 {} 条 · 超时 {}s · 结果 {} · 并发 {} · gzip {} · 文件名日期筛选 {}".format(
+        args.since, args.until, args.max_entries, args.timeout, "整条" if args.result_mode == "entries" else "单行",
+        args.concurrency, "关" if args.no_archives else "开", "关" if args.all_file_dates else "开")))
+    if not args.yes and sys.stdin.isatty() and diagnostic.input("执行？ [Y/n] ", markup=False).strip().lower() not in ("", "y", "yes"):
+        raise SystemExit(130)
+
+
 def main():
     command_parser = parser()
-    args = command_parser.parse_args()
+    argv = sys.argv[1:]
+    try:
+        resolved = expand(argv)
+    except ValueError as exc:
+        command_parser.error(str(exc))
+    args = command_parser.parse_args(resolved)
+    if resolved != argv:
+        preview(args, resolved)
     try:
         if args.command == "diagnostics":
             records = read_records(tail=args.tail, session_id=args.session_id, task_id=args.task_id)

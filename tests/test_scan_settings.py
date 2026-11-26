@@ -1,6 +1,35 @@
+import pytest
 from textual.widgets import Input, RadioSet, Static, TextArea
 from log_search.tui import LogSearchApp
-from log_search.cli import parser
+from log_search.cli import expand, parser
+
+
+def test_bare_query_becomes_local_today_search():
+    argv = expand(["--query", "TRACE", "-y"])
+    assert argv[0] == "search" and "--local" in argv and "--log-dir" in argv
+    since, until = argv[argv.index("--since") + 1], argv[argv.index("--until") + 1]
+    assert since.endswith(" 00:00:00") and until.endswith(" 00:00:00")
+    args = parser().parse_args(argv)
+    assert args.command == "search" and args.log_dir and args.yes
+
+
+def test_explicit_choices_survive_expansion():
+    # --root and --log-dir are one required group: injecting over an explicit value would abort the run.
+    explicit = ["search", "--local", "--root", "/tmp", "--query", "TRACE"]
+    assert expand(explicit) == explicit
+    assert "--log-dir" not in expand(["--root", "/tmp", "--query", "TRACE"])
+    # An explicit half-open bound is never completed with a guessed counterpart.
+    injected = expand(["--since", "2026-01-01 00:00:00", "--query", "TRACE"])
+    assert injected.count("--since") == 1 and "--until" not in injected
+    remote = expand(["--host", "demo", "--query", "TRACE"])
+    assert "--local" not in remote and "--log-dir" not in remote
+
+
+def test_bare_run_refuses_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match="家目录"):
+        expand(["--query", "TRACE"])
 
 
 def test_cli_scan_options():

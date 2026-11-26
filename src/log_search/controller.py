@@ -5,6 +5,7 @@ import contextlib
 import json
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import worker
@@ -14,6 +15,11 @@ from .transport import SshTransport, local_worker, terminate, validate_target
 
 def sort_key(entry):
     return (entry.get("ts") is None, entry.get("ts") or "", entry.get("service", ""), entry.get("file", ""), entry.get("start_line", 0))
+
+
+def today_time_range(now=None):
+    start = (now or datetime.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start.strftime("%Y-%m-%d %H:%M:%S"), (start + timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def request(action="search", *, host=None, root=None, log_dirs=None, query="", since=None, until=None, include_archives=True, include_unknown_time=False, timeout=60, max_entries=100, **extra):

@@ -157,6 +157,16 @@ def test_cli_jsonl_is_clean_and_diagnostics_filter_task(tmp_path):
     assert "BUSINESS_BODY_MUST_NOT_BE_LOGGED" not in result.stdout
 
 
+def test_bare_query_echoes_resolved_command_and_does_not_prompt_without_tty(tmp_path):
+    # The conftest puts the operation log under tmp_path/state; scanning it would make the run observe its own writes.
+    deployment = make_logs(tmp_path)
+    result = subprocess.run([sys.executable, "-m", "log_search", "--query", TRACE], capture_output=True, text=True, timeout=10, cwd=str(deployment))
+    assert result.returncode == 0, result.stderr
+    assert "等效命令：" in result.stderr and "扫描范围：" in result.stderr
+    assert datetime.now().strftime("%Y-%m-%d") in result.stderr
+    assert TRACE in result.stdout
+
+
 def test_cli_parse_error_is_recorded_without_raw_argument():
     result = subprocess.run([sys.executable, "-m", "log_search", "search", "--local", "--root", "/tmp", "--query", TRACE, "--timeout", "secret-not-a-number"], capture_output=True, text=True, timeout=10)
     assert result.returncode == 2

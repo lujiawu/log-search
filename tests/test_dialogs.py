@@ -3,7 +3,8 @@ from datetime import datetime
 import pytest
 from textual.widgets import Button, Input, RadioSet, RadioButton, Static, TextArea
 
-from log_search.dialogs import SettingsDialog, parse_fields, today_time_range
+from log_search.controller import today_time_range
+from log_search.dialogs import SettingsDialog, parse_fields
 from log_search.tui import LogSearchApp
 
 
