@@ -19,6 +19,9 @@ from .controller import Controller, request, sort_key, today_time_range
 from .grouping import aggregate
 from .dialogs import EditorDialog, SettingsDialog
 
+SEARCH_COLUMNS = ("时间", "服务", "级别", "日志")
+STATS_COLUMNS = ("次数", "异常类型", "关键帧", "首次", "最后", "样本")
+
 
 class LogTable(DataTable):
     """A single click only selects, even when clicking the current row again."""
@@ -158,7 +161,7 @@ class LogSearchApp(App):
     #status.partial { color: $warning; }
     #key-hints { height: 1; width: auto; color: $text-muted; padding: 0 1; }
     """
-    BINDINGS = [Binding("ctrl+c", "interrupt", "取消 / 复制", priority=True), Binding("ctrl+f", "query", "查询", priority=True), Binding("q", "quit", "退出"), Binding("r", "search", "重查"), Binding("x", "cancel", "取消")]
+    BINDINGS = [Binding("ctrl+c", "interrupt", "取消 / 复制", priority=True), Binding("ctrl+f", "query", "查询", priority=True), Binding("q", "quit", "退出"), Binding("r", "search", "重查"), Binding("e", "stats", "异常统计"), Binding("x", "cancel", "取消")]
 
     def __init__(self, ssh_config=None, root=None, host=None):
         super().__init__()
@@ -176,6 +179,10 @@ class LogSearchApp(App):
         self.operations = self.controller.operations
         self.search_task = None
         self.visible_entries = []
+        self.mode = "search"
+        self.columns_mode = "search"
+        self.stats = None
+        self.stats_groups = []
         self.selected_id = None
         self.dirty_results = False
         self.redrawing = False
@@ -211,10 +218,10 @@ class LogSearchApp(App):
         yield LogTable(id="results", cursor_type="row", show_header=False, show_row_labels=False, zebra_stripes=False)
         with Horizontal(id="status-line"):
             yield Static(self.status_text, id="status", markup=False)
-            yield Static("q 退出", id="key-hints", markup=False)
+            yield Static("e 统计 · q 退出", id="key-hints", markup=False)
 
     def on_mount(self):
-        self.query_one("#results", DataTable).add_columns("时间", "服务", "级别", "日志")
+        self.query_one("#results", DataTable).add_columns(*SEARCH_COLUMNS)
         self.record("ui.started", settings=self.settings, ssh_config=self.config_file, width=self.size.width, height=self.size.height)
         self.set_interval(.15, self.flush_results)
         theme = self.preferences.get("theme")
@@ -294,11 +301,44 @@ class LogSearchApp(App):
         values = self.settings
         return request(host=self.host, root=values["root"] if values["mode"] == "root" else None, log_dirs=values["log_dirs"] or None, query=self.query_one("#query", Input).value, since=values["since"], until=values["until"], include_archives=values["include_archives"], include_unknown_time=values["include_unknown_time"], **{key: values[key] for key in ("timeout", "max_entries", "filter_file_dates", "result_mode", "auto_expand_exceptions", "expand_pattern", "concurrency") if key in values})
 
+    async def action_stats(self):
+        if len(self.screen_stack) != 1 or self.running:
+            self.record("ui.stats_ignored", reason="task_running" if self.running else "dialog_open")
+            return
+        values = self.settings
+        try:
+            value = request("exception-stats", root=values["root"] if values["mode"] == "root" else None,
+                            log_dirs=values["log_dirs"] or None, since=values["since"], until=values["until"],
+                            include_archives=values["include_archives"], include_unknown_time=values["include_unknown_time"],
+                            timeout=600, top=10)
+            self.search_task = await self.controller.start(value, self.host)
+        except ValueError as exc:
+            self.operations.exception("ui.stats_validation_failed", exc, settings=values)
+            self.set_status(str(exc))
+            return
+        self.mode = "stats"
+        self.stats = None
+        self.stats_groups = []
+        self.selected_id = None
+        self.visible_entries = []
+        self.last_stats = {}
+        self.query_one("#query", Input).disabled = True
+        self.query_one("#target", Button).disabled = True
+        self.query_one("#status").remove_class("partial")
+        self.set_status("统计中… · Ctrl+C 取消")
+        self.dirty_results = True
+        self.reader = asyncio.create_task(self.consume(self.search_task))
+        self.reader.add_done_callback(self.reader_finished)
+        self.record("ui.stats_started", request=value)
+        self.query_one("#results", DataTable).focus()
+
     async def action_search(self):
         if len(self.screen_stack) != 1 or self.running:
             self.record("ui.search_ignored", reason="task_running" if self.running else "dialog_open")
             return
         self.record("ui.search_submitted", task_id=None, request_id=None, previous_task_id=self.search_task.request["task_id"] if self.search_task else None, settings=self.settings, query=self.query_one("#query", Input).value)
+        self.mode = "search"
+        self.dirty_results = True
         try:
             value = self.compose_request()
             self.search_task = await self.controller.start(value, self.host)
@@ -340,15 +380,25 @@ class LogSearchApp(App):
                 continue
             if event["type"] == "progress":
                 self.last_stats = event
-                self.set_status("搜索中 {}s · {} 文件 · {}条 · Ctrl+C 取消".format(event["elapsed"], event["scanned"], event["entries"]))
+                if self.mode == "stats":
+                    self.set_status("统计中 {}s · {} 文件 · {} MiB · Ctrl+C 取消".format(event.get("elapsed", "?"), event.get("scanned", 0), round(event.get("bytes_read", 0) / 1048576, 1)))
+                else:
+                    self.set_status("搜索中 {}s · {} 文件 · {}条 · Ctrl+C 取消".format(event["elapsed"], event["scanned"], event["entries"]))
             elif event["type"] == "entry":
+                self.dirty_results = True
+            elif event["type"] == "exception_stats":
+                self.stats = event
                 self.dirty_results = True
             elif event["type"] == "warning":
                 self.set_status(event.get("message", ""))
             elif event["type"] == "done":
                 self.last_stats = event
                 labels = dict(completed="完成", cancelled="已取消", timed_out="已超时", limited="达到上限", failed="失败")
-                text = "{} {}s · {}条 · {}".format(labels.get(event["outcome"], event["outcome"]), event.get("elapsed", "?"), len(task.entries), "范围完整" if event["scope_complete"] else "部分结果")
+                if self.mode == "stats":
+                    stats = self.stats or {}
+                    text = "{} {}s · 总条目 {} · 异常 {} · 率 {:.2%} · {} 组".format(labels.get(event.get("outcome"), event.get("outcome")), event.get("elapsed", "?"), stats.get("total_entries", 0), stats.get("exception_entries", 0), stats.get("exception_rate", 0), stats.get("groups_total", 0))
+                else:
+                    text = "{} {}s · {}条 · {}".format(labels.get(event["outcome"], event["outcome"]), event.get("elapsed", "?"), len(task.entries), "范围完整" if event["scope_complete"] else "部分结果")
                 if not event.get("content_complete", True):
                     text += " · 预览截断"
                 if event.get("time_unknown"):
@@ -365,11 +415,19 @@ class LogSearchApp(App):
         if not self.dirty_results or len(self.screen_stack) != 1:
             return
         self.dirty_results = False
+        table = self.query_one("#results", DataTable)
+        if self.columns_mode != self.mode:
+            table.clear(columns=True)
+            table.add_columns(*(STATS_COLUMNS if self.mode == "stats" else SEARCH_COLUMNS))
+            table.show_header = self.mode == "stats"
+            self.columns_mode = self.mode
+        if self.mode == "stats":
+            self.flush_stats(table)
+            return
         entries = self.search_task.entries if self.search_task else []
         filtered = sorted(entries, key=sort_key)
         self.visible_entries = aggregate(filtered)
         dates = {entry["ts"].split(" ")[0] for entry in self.visible_entries if entry.get("ts")}
-        table = self.query_one("#results", DataTable)
         old_scroll = table.scroll_y
         self.redrawing = True
         table.clear()
@@ -401,6 +459,26 @@ class LogSearchApp(App):
         self.set_status()
         self.record("ui.results_rendered", received_entries=len(entries), visible_entries=len(self.visible_entries), table_rows=table.row_count, selected_entry_id=self.selected_id, task_outcome=self.search_task.done.get("outcome") if self.search_task and self.search_task.done else "running")
 
+    def flush_stats(self, table):
+        self.redrawing = True
+        table.clear()
+        self.stats_groups = (self.stats or {}).get("groups", [])
+        for index, group in enumerate(self.stats_groups):
+            sample = group.get("sample") or {}
+            table.add_row(
+                Text("{:,}".format(group["count"])),
+                Text(group["exception_type"]),
+                Text(" ".join(group["key_frames"]) or "—"),
+                Text((group.get("first_seen") or "—")[:19]),
+                Text((group.get("last_seen") or "—")[:19]),
+                Text("{}:{}".format(sample.get("file", ""), sample.get("start_line", ""))),
+                key="g{}".format(index))
+        if self.stats_groups:
+            table.move_cursor(row=0, scroll=False)
+        self.redrawing = False
+        self.set_status()
+        self.record("ui.stats_rendered", groups=len(self.stats_groups), table_rows=table.row_count)
+
     def selected_entry(self):
         return next((entry for entry in self.visible_entries if entry["id"] == self.selected_id), None)
 
@@ -412,10 +490,47 @@ class LogSearchApp(App):
 
     @on(DataTable.RowSelected, "#results")
     def open_detail(self, event):
+        if self.mode == "stats":
+            self.run_worker(self.open_group(event.row_key.value), exclusive=True, group="group-detail")
+            return
         entry = next((entry for entry in self.visible_entries if entry["id"] == event.row_key.value), None)
         if entry and self.search_task:
             self.selected_id = entry["id"]
             self.push_screen(DetailScreen(self.search_task, entry))
+
+    async def open_group(self, key):
+        """Fetch the sample entry once so the detail screen shows the whole stack."""
+        try:
+            group = self.stats_groups[int(key[1:])]
+        except (ValueError, IndexError, AttributeError):
+            return
+        sample = group.get("sample") or {}
+        if not sample.get("file") or self.search_task is None:
+            return
+        scope = self.search_task.request["scope"]
+        value = request("context", root=scope.get("root"), log_dirs=scope.get("log_dirs"),
+                        file=sample["file"], line=sample["start_line"], timeout=15)
+        self.set_status("读取堆栈中…")
+        try:
+            task = await self.app.controller.start(value, self.search_task.host)
+        except ValueError as exc:
+            self.set_status(str(exc))
+            return
+        try:
+            async for event in task.events():
+                if event["type"] == "context":
+                    entries = event.get("entries") or []
+                    target = event.get("target_line")
+                    entry = next((item for item in entries if target is not None and item["start_line"] <= target <= item["end_line"]), entries[0] if entries else None)
+                    if entry:
+                        self.push_screen(DetailScreen(self.search_task, entry))
+                    return
+                if event["type"] == "warning":
+                    self.set_status(event.get("message", ""))
+                elif event["type"] == "done":
+                    self.set_status("堆栈未加载：" + str(event.get("outcome")))
+        finally:
+            await task.cancel()
 
     @on(Input.Submitted, "#query")
     async def submitted(self):

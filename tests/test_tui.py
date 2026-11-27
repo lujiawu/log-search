@@ -284,6 +284,45 @@ async def test_settings_endpoint_is_used_for_ssh_and_can_be_edited(tmp_path, mon
         await app.action_quit()
 
 
+async def test_stats_table_and_full_stack_detail(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    logs = tmp_path / "app-beta/logs"
+    logs.mkdir(parents=True)
+    frames = "".join(" at com.foo.Frame{}(Frame.java:{})\n".format(i, i) for i in range(220))
+    (logs / "system.log").write_text(
+        "2026-01-01 10:00:00 INFO before\n"
+        "2026-01-01 10:00:01 ERROR java.lang.RuntimeException: boom\n" + frames +
+        "2026-01-01 10:00:02 INFO after\n")
+    app = LogSearchApp(root=str(tmp_path))
+    async with app.run_test(size=(120, 36)) as pilot:
+        table = app.query_one("#results", DataTable)
+        table.focus()
+        await pilot.press("e")
+        await wait_finished(pilot, app)
+        assert app.mode == "stats" and app.stats["exception_entries"] == 1
+        for _ in range(20):
+            await pilot.pause(.05)
+            if table.row_count == 1:
+                break
+        assert table.show_header and table.row_count == 1
+        assert str(table.get_row_at(0)[1]) == "java.lang.RuntimeException"
+        await pilot.press("enter")
+        for _ in range(100):
+            await pilot.pause(.05)
+            if isinstance(app.screen, DetailScreen):
+                break
+        assert isinstance(app.screen, DetailScreen)
+        # 搜索预览截断在 150 行 / 16 KiB；统计详情必须展示完整堆栈
+        assert "com.foo.Frame219" in app.screen.query_one("#detail", LogText).text
+        await pilot.press("escape")
+        await pilot.press("ctrl+f")
+        app.query_one("#query", Input).value = "boom"
+        await pilot.press("enter")
+        await wait_finished(pilot, app)
+        assert app.mode == "search" and not table.show_header
+        await app.action_quit()
+
+
 async def test_grouped_rows_details_retain_all_sources(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     root = create_logs(tmp_path)
