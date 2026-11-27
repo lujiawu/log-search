@@ -17,10 +17,12 @@ from .clipboard import copy_text
 from .config import load_preferences, save_preferences, ssh_config_path
 from .controller import Controller, request, sort_key, today_time_range
 from .grouping import aggregate
-from .dialogs import EditorDialog, SettingsDialog
+from .dialogs import DirectoryDialog, EditorDialog, SettingsDialog
 
 SEARCH_COLUMNS = ("时间", "服务", "级别", "日志")
 STATS_COLUMNS = ("次数", "异常类型", "关键帧", "首次", "最后", "样本")
+SEARCH_HINT = "traceId / 文本 · Enter 查询"
+STATS_HINT = "服务子目录（可空=全部）· Ctrl+D 选择 · Enter 统计"
 
 
 class LogTable(DataTable):
@@ -154,6 +156,7 @@ class LogSearchApp(App):
     #query-line { height: 1; background: $surface; }
     #target { height: 1; width: auto; min-width: 5; max-width: 50%; border: none; padding: 0 1; }
     #query { height: 1; width: 1fr; border: none; padding: 0; }
+    #tab-search, #tab-stats { height: 1; min-width: 9; width: auto; border: none; padding: 0 1; }
     #query-separator { height: 1; margin: 0; color: $text-muted; }
     #results { height: 1fr; border: none; padding: 0; }
     #status-line { height: 1; }
@@ -161,7 +164,7 @@ class LogSearchApp(App):
     #status.partial { color: $warning; }
     #key-hints { height: 1; width: auto; color: $text-muted; padding: 0 1; }
     """
-    BINDINGS = [Binding("ctrl+c", "interrupt", "取消 / 复制", priority=True), Binding("ctrl+f", "query", "查询", priority=True), Binding("q", "quit", "退出"), Binding("r", "search", "重查"), Binding("e", "stats", "异常统计"), Binding("x", "cancel", "取消")]
+    BINDINGS = [Binding("ctrl+c", "interrupt", "取消 / 复制", priority=True), Binding("ctrl+f", "query", "查询", priority=True), Binding("ctrl+d", "pick_dir", "选择目录", priority=True), Binding("q", "quit", "退出"), Binding("r", "search", "重查"), Binding("e", "stats", "异常统计"), Binding("x", "cancel", "取消")]
 
     def __init__(self, ssh_config=None, root=None, host=None):
         super().__init__()
@@ -181,6 +184,8 @@ class LogSearchApp(App):
         self.visible_entries = []
         self.mode = "search"
         self.columns_mode = "search"
+        self.query_text = ""
+        self.stats_dir = ""
         self.stats = None
         self.stats_groups = []
         self.selected_id = None
@@ -213,7 +218,9 @@ class LogSearchApp(App):
     def compose(self) -> ComposeResult:
         with Horizontal(id="query-line"):
             yield Button(self.host or "本机", id="target", compact=True)
-            yield Input(placeholder="traceId / 文本 · Enter 查询", id="query", compact=True)
+            yield Input(placeholder=SEARCH_HINT, id="query", compact=True)
+            yield Button("日志搜索", id="tab-search", compact=True, variant="primary")
+            yield Button("堆栈统计", id="tab-stats", compact=True)
         yield Rule(id="query-separator")
         yield LogTable(id="results", cursor_type="row", show_header=False, show_row_labels=False, zebra_stripes=False)
         with Horizontal(id="status-line"):
@@ -301,11 +308,38 @@ class LogSearchApp(App):
         values = self.settings
         return request(host=self.host, root=values["root"] if values["mode"] == "root" else None, log_dirs=values["log_dirs"] or None, query=self.query_one("#query", Input).value, since=values["since"], until=values["until"], include_archives=values["include_archives"], include_unknown_time=values["include_unknown_time"], **{key: values[key] for key in ("timeout", "max_entries", "filter_file_dates", "result_mode", "auto_expand_exceptions", "expand_pattern", "concurrency") if key in values})
 
+    def set_mode(self, mode):
+        """Tab switch: swap the input value, placeholder and table columns; never starts a query."""
+        if self.mode == mode or self.running:
+            return
+        field = self.query_one("#query", Input)
+        if self.mode == "stats":
+            self.stats_dir = field.value
+        else:
+            self.query_text = field.value
+        self.mode = mode
+        field.value = self.stats_dir if mode == "stats" else self.query_text
+        field.placeholder = STATS_HINT if mode == "stats" else SEARCH_HINT
+        self.query_one("#tab-search", Button).variant = "primary" if mode == "search" else "default"
+        self.query_one("#tab-stats", Button).variant = "primary" if mode == "stats" else "default"
+        self.dirty_results = True
+        field.focus()
+
     async def action_stats(self):
         if len(self.screen_stack) != 1 or self.running:
             self.record("ui.stats_ignored", reason="task_running" if self.running else "dialog_open")
             return
         values = self.settings
+        self.set_mode("stats")
+        field = self.query_one("#query", Input)
+        directory = field.value.strip()
+        if directory and values["mode"] == "root" and not directory.startswith("/"):
+            directory = str(Path(values["root"]) / directory)
+        if directory:
+            # 统计页的目录选择就是共享 scope：切回搜索页也是这个范围。
+            field.value = self.stats_dir = directory
+            values["log_dirs"] = [directory]
+        self.record("ui.stats_submitted", query=directory, settings=values)
         try:
             value = request("exception-stats", root=values["root"] if values["mode"] == "root" else None,
                             log_dirs=values["log_dirs"] or None, since=values["since"], until=values["until"],
@@ -316,7 +350,6 @@ class LogSearchApp(App):
             self.operations.exception("ui.stats_validation_failed", exc, settings=values)
             self.set_status(str(exc))
             return
-        self.mode = "stats"
         self.stats = None
         self.stats_groups = []
         self.selected_id = None
@@ -336,8 +369,8 @@ class LogSearchApp(App):
         if len(self.screen_stack) != 1 or self.running:
             self.record("ui.search_ignored", reason="task_running" if self.running else "dialog_open")
             return
+        self.set_mode("search")
         self.record("ui.search_submitted", task_id=None, request_id=None, previous_task_id=self.search_task.request["task_id"] if self.search_task else None, settings=self.settings, query=self.query_one("#query", Input).value)
-        self.mode = "search"
         self.dirty_results = True
         try:
             value = self.compose_request()
@@ -424,7 +457,7 @@ class LogSearchApp(App):
         if self.mode == "stats":
             self.flush_stats(table)
             return
-        entries = self.search_task.entries if self.search_task else []
+        entries = self.search_task.entries if self.search_task and self.search_task.request.get("action") == "search" else []
         filtered = sorted(entries, key=sort_key)
         self.visible_entries = aggregate(filtered)
         dates = {entry["ts"].split(" ")[0] for entry in self.visible_entries if entry.get("ts")}
@@ -534,16 +567,47 @@ class LogSearchApp(App):
 
     @on(Input.Submitted, "#query")
     async def submitted(self):
-        await self.action_search()
+        if self.mode == "stats":
+            await self.action_stats()
+        else:
+            await self.action_search()
 
     @on(Input.Changed, "#query")
     def query_changed(self):
+        if self.query_one("#query", Input).value in (self.query_text, self.stats_dir):
+            return
         if self.search_task and self.search_task.done:
             self.set_status("查询已更改 · 日志仍属上次查询")
 
     def action_query(self):
         if len(self.screen_stack) == 1 and not self.running:
+            self.set_mode("search")
             self.query_one("#query", Input).focus()
+
+    def action_pick_dir(self):
+        if self.mode != "stats" or self.running or len(self.screen_stack) != 1:
+            return
+        self.run_worker(self.pick_dir(), exclusive=True, group="dir-pick")
+
+    async def pick_dir(self):
+        root = self.settings["root"] if self.settings["mode"] == "root" else None
+        self.set_status("正在发现日志目录…")
+        try:
+            directories, _, _ = await self.controller.logs(request("logs", root=root, timeout=20), self.host)
+        except (OSError, ValueError) as exc:
+            self.operations.exception("ui.directory_discovery_failed", exc, target=self.host or "local", root=root)
+            self.set_status(str(exc))
+            return
+        if not directories:
+            self.set_status("未发现服务日志目录")
+            return
+        selected = await self.push_screen_wait(DirectoryDialog(directories, self.settings["log_dirs"]))
+        if selected:
+            # 统计只服务单个目录；同时写回共享 scope，搜索页跟随。
+            self.settings["log_dirs"] = [selected[0]]
+            self.stats_dir = selected[0]
+            self.query_one("#query", Input).value = selected[0]
+            self.set_status("目录已选择 · Enter 统计")
 
     async def action_settings(self):
         if len(self.screen_stack) != 1 or self.running:
@@ -601,6 +665,10 @@ class LogSearchApp(App):
         self.record("ui.button", button=event.button.id)
         if event.button.id == "target":
             await self.action_settings()
+        elif event.button.id == "tab-search":
+            self.set_mode("search")
+        elif event.button.id == "tab-stats":
+            self.set_mode("stats")
 
     async def action_quit(self):
         self.record("ui.quit", running=self.running)

@@ -2,9 +2,9 @@ import asyncio
 
 import pytest
 from textual.document._document import Selection
-from textual.widgets import Button, DataTable, Input, Static, TextArea
+from textual.widgets import Button, DataTable, Input, SelectionList, Static, TextArea
 
-from log_search.dialogs import SettingsDialog
+from log_search.dialogs import DirectoryDialog, SettingsDialog
 from log_search.transport import local_worker
 from log_search.tui import DetailScreen, LogSearchApp, LogText
 
@@ -320,6 +320,62 @@ async def test_stats_table_and_full_stack_detail(tmp_path, monkeypatch):
         await pilot.press("enter")
         await wait_finished(pilot, app)
         assert app.mode == "search" and not table.show_header
+        await app.action_quit()
+
+
+async def test_tabs_switch_input_and_each_enter_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    logs = tmp_path / "deploy" / "svc" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "app.log").write_text("2026-01-01 10:00:01 ERROR java.lang.RuntimeException: boom\n at com.foo.Bar.baz(Bar.java:1)\n")
+    app = LogSearchApp(root=str(tmp_path / "deploy"))
+    async with app.run_test(size=(120, 36)) as pilot:
+        field = app.query_one("#query", Input)
+        table = app.query_one("#results", DataTable)
+        await pilot.click("#tab-stats")
+        assert app.mode == "stats" and "子目录" in field.placeholder
+        field.value = "svc/logs"
+        await pilot.press("enter")
+        await wait_finished(pilot, app)
+        # Enter 用相对子目录解析成绝对路径，写回共享 scope
+        assert app.search_task.request["action"] == "exception-stats"
+        assert app.settings["log_dirs"] == [str(logs)]
+        assert app.stats["exception_entries"] == 1
+        for _ in range(20):
+            await pilot.pause(.05)
+            if table.row_count == 1:
+                break
+        assert table.show_header and str(table.get_row_at(0)[1]) == "java.lang.RuntimeException"
+        # 切回搜索页只换输入区与列头，不自动发查询
+        await pilot.click("#tab-search")
+        assert app.mode == "search" and field.value == ""
+        assert app.search_task.request["action"] == "exception-stats"
+        await pilot.pause(.2)
+        assert not table.show_header
+        field.value = "boom"
+        await pilot.press("enter")
+        await wait_finished(pilot, app)
+        assert app.search_task.request["action"] == "search" and table.row_count == 1
+        await app.action_quit()
+
+
+async def test_stats_tab_picks_directory_with_ctrl_d(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    root = create_logs(tmp_path)
+    app = LogSearchApp(root=str(root))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.click("#tab-stats")
+        await pilot.press("ctrl+d")
+        for _ in range(100):
+            await pilot.pause(.05)
+            if isinstance(app.screen, DirectoryDialog):
+                break
+        app.screen.query_one("#directories", SelectionList).select(str(root / "app-beta" / "logs"))
+        await pilot.press("ctrl+s")
+        await pilot.pause(.3)
+        assert len(app.screen_stack) == 1
+        assert app.settings["log_dirs"] == [str(root / "app-beta" / "logs")]
+        assert app.query_one("#query", Input).value == str(root / "app-beta" / "logs")
         await app.action_quit()
 
 
