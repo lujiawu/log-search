@@ -334,6 +334,26 @@ def log_directories(scope, runtime):
     return directories
 
 
+def picker_directories(scope, runtime):
+    """Pick-list candidates: root's direct subdirectories, preferring <child>/logs."""
+    root = Path(scope["root"])
+    if not no_links(root) or not root.is_dir():
+        raise ValueError("部署根目录不存在或包含符号链接")
+    result = []
+    for child in sorted(root.iterdir()):
+        runtime.check()
+        logs = child / "logs"
+        if child.is_symlink() or logs.is_symlink():
+            runtime.increment("skipped_links")
+            runtime.warning("symlink", "跳过符号链接", child)
+        elif logs.is_dir():
+            result.append(logs)
+        elif child.is_dir() and child.name == "logs":
+            # root 本身就是服务目录时，它自己的 logs 就是候选；其它子目录靠手输。
+            result.append(child)
+    return result
+
+
 def list_logs(directories, runtime):
     """Read-only listing for the directory picker; counts only, no file bodies."""
     result = []
@@ -358,7 +378,7 @@ def list_logs(directories, runtime):
                 runtime.warning("read_error", str(exc), current)
         result.append(dict(service=directory.parent.name if directory.name == "logs" else directory.name,
                            path=str(directory), files=files, bytes=total))
-    runtime.emit("logs", directories=result)
+    runtime.emit("logs", directories=[item for item in result if item["files"]])
 
 
 def discover(directories, runtime):
@@ -1602,7 +1622,9 @@ def execute(request, emit, cancelled=None):
     runtime = Runtime(request, emit, cancelled)
     try:
         validate(request)
-        directories = log_directories(request["scope"], runtime)
+        scope = request["scope"]
+        pick = request.get("action") == "logs" and scope.get("root") and not scope.get("log_dirs")
+        directories = picker_directories(scope, runtime) if pick else log_directories(scope, runtime)
         if not directories:
             raise ValueError("未找到日志目录")
         if not shutil.which("rg") and request.get("action", "search") not in ("logs", "exception-stats"):

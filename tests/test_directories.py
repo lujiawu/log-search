@@ -56,6 +56,19 @@ def test_logs_action_lists_services_without_bodies(tmp_path):
     assert done["outcome"] == "completed" and done["scope_basis"] == "log_directory_listing"
 
 
+def test_logs_action_accepts_service_root_and_hides_empty_dirs(tmp_path):
+    root = tmp_path / "c-iot"
+    (root / "logs" / "archive").mkdir(parents=True)
+    (root / "logs" / "system.log").write_text("2026-01-01 10:00:01 ERROR TRACE\n")
+    (root / "logs" / "archive" / "system.1.gz").write_bytes(gzip.compress(b"2026-01-01 11:00:00 INFO TRACE\n"))
+    (root / "data").mkdir()
+    (root / "data" / "blob.bin").write_text("not a log\n")
+    events = execute(request(action="logs", root=str(root)))
+    listing = next(event["directories"] for event in events if event["type"] == "logs")
+    # root 本身就是服务目录：只有它的 logs 成为候选；data/external 不该混进来
+    assert [(item["service"], item["path"], item["files"]) for item in listing] == [("c-iot", str(root / "logs"), 2)]
+
+
 def test_root_with_selected_directories_keeps_relative_display(tmp_path):
     root = create_root(tmp_path)
     events = execute(request(root=str(root), log_dirs=[str(root / "app-alpha" / "logs")], query="TRACE"))

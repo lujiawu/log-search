@@ -380,6 +380,26 @@ async def test_stats_tab_picks_directory_with_ctrl_d(tmp_path, monkeypatch):
         await app.action_quit()
 
 
+async def test_stats_picker_lists_service_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    root = tmp_path / "c-iot"
+    (root / "logs").mkdir(parents=True)
+    (root / "logs" / "system.log").write_text("2026-01-01 10:00:01 ERROR java.lang.IllegalStateException: x\n")
+    (root / "data").mkdir()
+    app = LogSearchApp(root=str(root))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.click("#tab-stats")
+        await pilot.press("ctrl+d")
+        for _ in range(100):
+            await pilot.pause(.05)
+            if isinstance(app.screen, DirectoryDialog):
+                break
+        options = [option.value for option in app.screen.query_one("#directories", SelectionList).options]
+        assert options == [str(root / "logs")]
+        await pilot.press("escape")
+        await app.action_quit()
+
+
 async def test_grouped_rows_details_retain_all_sources(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     root = create_logs(tmp_path)
