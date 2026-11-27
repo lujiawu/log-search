@@ -59,7 +59,7 @@ def validate(request):
     if not isinstance(request, dict) or request.get("protocol", 1) != PROTOCOL:
         raise ValueError("不支持的协议")
     action = request.get("action", "search")
-    if action not in ("search", "context", "check", "logs"):
+    if action not in ("search", "context", "check", "logs", "exception-stats"):
         raise ValueError("不支持的操作")
     scope = request.get("scope", {})
     if not isinstance(scope, dict):
@@ -102,6 +102,13 @@ def validate(request):
         since, until = parse_time(request.get("since")), parse_time(request.get("until"))
         if since is not None and until is not None and since >= until:
             raise ValueError("开始时间必须早于结束时间")
+    if action == "exception-stats":
+        since, until = parse_time(request.get("since")), parse_time(request.get("until"))
+        if since is not None and until is not None and since >= until:
+            raise ValueError("开始时间必须早于结束时间")
+        top = request.get("top", 10)
+        if isinstance(top, bool) or not isinstance(top, int) or not 1 <= top <= 1000:
+            raise ValueError("top 必须是 1～1000 的整数")
     if action == "context":
         filename = request.get("file", "")
         if not isinstance(filename, str) or not filename or "\x00" in filename or ".." in Path(filename).parts:
@@ -754,11 +761,32 @@ def parsed_entries(path, kind, query, runtime, byte_limit=16384, line_limit=150,
                 stream.close()
 
 
-def record(entry, path, directory, before, runtime):
+def display_path(path, runtime):
     if runtime.request["scope"].get("root"):
-        display = str(path.relative_to(runtime.request["scope"]["root"]))
-    else:
-        display = str(path)
+        return str(path.relative_to(runtime.request["scope"]["root"]))
+    return str(path)
+
+
+def filename_day(path):
+    match = re.search(r"\d{4}-\d\d-\d\d", path.name)
+    if not match:
+        return None
+    try:
+        return datetime.datetime.strptime(match.group(0), "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def day_excluded(day, since, until):
+    """Same filename-date rule for search and exception-stats."""
+    if day is None:
+        return False
+    end = day + datetime.timedelta(days=1) if day.year < 9999 or day.month < 12 or day.day < 31 else datetime.datetime.max
+    return (since is not None and end <= since) or (until is not None and day >= until)
+
+
+def record(entry, path, directory, before, runtime):
+    display = display_path(path, runtime)
     key = "{}:{}:{}:{}".format(path, before["inode"], before["mtime_ns"], entry.start)
     return dict(id=hashlib.sha256(key.encode("utf-8", "surrogateescape")).hexdigest()[:24], ts=entry.timestamp.isoformat(" ") if entry.timestamp else None, time_offset=entry.offset, service=directory.parent.name if directory.name == "logs" else directory.name, level=entry.level, file=display, start_line=entry.start, end_line=entry.end, match_lines=entry.matches, preview=entry.view(), preview_truncated=entry.truncated, source_identity=before, source_changed=False, time_unknown=entry.timestamp is None, content_hash=entry.content_hash, raw_bytes=entry.raw_bytes, capture_complete=entry.capture_complete, content_kind="entry")
 
@@ -1153,18 +1181,9 @@ def run_search(directories, runtime):
             kind = file_kind(path)
             if kind == "gzip" and not runtime.request.get("include_archives", True):
                 continue
-            date_match = re.search(r"\d{4}-\d\d-\d\d", path.name)
-            filename_date = date_match.group(0) if date_match else None
-            day = None
-            if filename_date:
-                try:
-                    day = datetime.datetime.strptime(filename_date, "%Y-%m-%d")
-                except ValueError:
-                    pass
-            excluded = False
-            if runtime.request.get("filter_file_dates", True) and day is not None:
-                end = day + datetime.timedelta(days=1) if day.year < 9999 or day.month < 12 or day.day < 31 else datetime.datetime.max
-                excluded = (since is not None and end <= since) or (until is not None and day >= until)
+            day = filename_day(path)
+            filename_date = day.strftime("%Y-%m-%d") if day is not None else None
+            excluded = runtime.request.get("filter_file_dates", True) and day_excluded(day, since, until)
             if excluded:
                 runtime.increment("skipped_time_files")
                 runtime.phase("prefilter", path, started, filename_date=filename_date,
@@ -1303,6 +1322,279 @@ def context(directories, runtime):
     runtime.emit("context", entries=safe_results, target_line=target, source_changed=changed, truncated=truncated or any(e["preview_truncated"] for e in safe_results))
 
 
+AWK_EXCEPTIONS = r"""
+BEGIN {
+  HEAD  = "^[ \t]*(\\[[^]]{0,256}\\])?[ \t]*[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][ T][0-9][0-9]:[0-9][0-9]:[0-9][0-9]"
+  TS    = "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][ T][0-9][0-9]:[0-9][0-9]:[0-9][0-9]"
+  LVL   = "(^|[^A-Za-z0-9_])(ERROR|FATAL)([^A-Za-z0-9_]|$)"
+  EXC   = "(^|[^A-Za-z0-9_$.])[A-Za-z0-9_$.]*(Exception|Error)([^A-Za-z0-9_]|$)"
+  PYF   = "^[ \t]*File[ \t]+\"[^\"]*\",[ \t]*line[ \t]+[0-9]+,[ \t]+in[ \t]+[^ \t]+[ \t\r]*$"
+  SINCE = norm(SINCE); UNTIL = norm(UNTIL)
+  total = 0; exceptions = 0; unstacked = 0; unknown = 0; bytes = 0; line = 0; last = 0
+}
+function norm(value,   frac) {
+  if (value == "") return ""
+  gsub(/T/, " ", value); gsub(/,/, ".", value)
+  if (length(value) <= 19) return substr(value, 1, 19) ".000000"
+  frac = substr(value, 21); gsub(/[^0-9]/, "", frac)
+  while (length(frac) < 6) frac = frac "0"
+  return substr(value, 1, 19) "." substr(frac, 1, 6)
+}
+function headts(text,   stamp, rest, frac) {
+  if (!match(text, TS)) return ""
+  stamp = substr(text, RSTART, 19); gsub(/T/, " ", stamp)
+  rest = substr(text, RSTART + 19, 7)
+  if (substr(rest, 1, 1) == "." || substr(rest, 1, 1) == ",") {
+    frac = substr(rest, 2); gsub(/[^0-9]/, "", frac)
+    while (length(frac) < 6) frac = frac "0"
+    return stamp "." substr(frac, 1, 6)
+  }
+  return stamp ".000000"
+}
+function begin(stamp, error) {
+  have = 1; estart = line; ets = stamp; eerr = error; eexc = 0; estack = 0; etype = ""; nf = 0; f1 = ""; f2 = ""; f3 = ""
+}
+function addframe(name) {
+  if (nf >= 3) return
+  nf++
+  if (nf == 1) f1 = name; else if (nf == 2) f2 = name; else f3 = name
+}
+function frame(text,   name, cut) {
+  sub(/^[ \t]+/, "", text)
+  if (substr(text, 1, 3) == "at ") {
+    sub(/^at[ \t]+/, "", text)
+    cut = index(text, "(")
+    if (cut > 1) {
+      name = substr(text, 1, cut - 1); sub(/[ \t]+$/, "", name)
+      if (name ~ /^[A-Za-z0-9_$.<>]+$/) { eexc = 1; estack = 1; addframe(name) }
+    }
+    return
+  }
+  if (text ~ PYF) {
+    name = text; sub(/^.*[ \t]in[ \t]+/, "", name); sub(/[ \t\r]+$/, "", name)
+    eexc = 1; estack = 1; addframe(name)
+  }
+}
+function flush(   key) {
+  if (!have) return
+  have = 0
+  if (ets == "") {
+    unknown++
+    if (SINCE != "" || UNTIL != "") { if (!UNK) return }
+  } else if ((SINCE != "" && ets < SINCE) || (UNTIL != "" && ets >= UNTIL)) return
+  total++
+  if (!(eerr || eexc)) return
+  exceptions++
+  if (!estack) { unstacked++; return }
+  key = etype "|" f1 "," f2 "," f3
+  if (!(key in gcount)) {
+    gcount[key] = 0; gtype[key] = etype; gframes[key] = f1 "," f2 "," f3
+    gfirst[key] = ets; glast[key] = ets; gstart[key] = estart; gend[key] = last; gts[key] = ets
+  }
+  gcount[key]++
+  if (ets != "") {
+    if (gfirst[key] == "" || ets < gfirst[key]) gfirst[key] = ets
+    if (glast[key] == "" || ets > glast[key]) glast[key] = ets
+  }
+}
+{
+  line++
+  bytes += length($0) + 1
+  c = substr($0, 1, 1)
+  head = 0
+  if (c == " " || c == "\t" || c == "[" || (c >= "0" && c <= "9")) {
+    text = substr($0, 1, 1024)
+    if (text ~ HEAD) { flush(); head = 1; begin(headts(text), (text ~ LVL)) }
+  }
+  if (!head && line == 1) begin("", ($0 ~ LVL))
+  if (index($0, "Exception") || index($0, "Error")) {
+    if (match($0, EXC)) {
+      eexc = 1; estack = 1
+      if (etype == "") {
+        etype = substr($0, RSTART, RLENGTH)
+        sub(/^[^A-Za-z0-9_$.]/, "", etype); sub(/[^A-Za-z0-9_$.]$/, "", etype)
+      }
+    }
+  } else if (index($0, "Caused by:") || index($0, "Suppressed:") || index($0, "Traceback (")) {
+    eexc = 1; estack = 1
+  }
+  if (c == "\t" && substr($0, 2, 2) == "at" && substr($0, 4, 1) == " ") {
+    frame(substr($0, 2, 1024))
+  } else if ((c == " " || c == "\t") && (index($0, "at ") || index($0, "File "))) {
+    frame(substr($0, 1, 1024))
+  }
+  last = line
+}
+END {
+  flush()
+  printf "T\t%d\t%d\t%d\t%d\t%d\n", total, exceptions, unstacked, unknown, bytes
+  for (key in gcount) printf "G\t%d\t%s\t%s\t%d\t%d\t%s\t%s\t%s\n", gcount[key], gfirst[key], glast[key], gstart[key], gend[key], gts[key], gtype[key], gframes[key]
+}
+"""
+
+
+def scan_exceptions(path, kind, runtime, since, until):
+    """One native pass per file: awk groups the stacks, no log line ever enters Python."""
+    source = None
+    stream = None
+    if kind == "gzip":
+        source = subprocess.Popen(["gzip", "-cd", "--", str(path)], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+        with runtime.lock:
+            runtime.processes.add(source)
+        stream = source.stdout
+    else:
+        stream = open_regular(path)
+    request = runtime.request
+    args = ["awk", "-v", "SINCE=" + (since.isoformat(" ") if since else ""),
+            "-v", "UNTIL=" + (until.isoformat(" ") if until else ""),
+            "-v", "UNK=" + ("1" if request.get("include_unknown_time") else "0"), AWK_EXCEPTIONS]
+    process = subprocess.Popen(args, stdin=stream, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True, env=dict(os.environ, LC_ALL="C"))
+    if source is not None:
+        source.stdout.close()
+    runtime.process = process
+    output, errors = bytearray(), bytearray()
+    try:
+        streams = [process.stdout, process.stderr]
+        while streams:
+            runtime.progress()
+            ready, _, _ = select.select(streams, [], [], .05)
+            for current in ready:
+                block = os.read(current.fileno(), CHUNK)
+                if not block:
+                    streams.remove(current)
+                elif current is process.stderr:
+                    if len(errors) < 8192:
+                        errors.extend(block[:8192 - len(errors)])
+                else:
+                    output.extend(block)
+                    if len(output) > MAX_MESSAGE:
+                        raise ValueError("awk 输出超限")
+        status = process.wait()
+        gzip_status = source.wait() if source is not None else 0
+    finally:
+        stop_process(process)
+        stop_process(source)
+        process.stdout.close()
+        process.stderr.close()
+        if source is not None:
+            with runtime.lock:
+                runtime.processes.discard(source)
+        else:
+            stream.close()
+        runtime.process = None
+    if status != 0:
+        raise ValueError("awk 失败: " + clean(errors.decode("utf-8", "replace"))[:200])
+    if gzip_status != 0:
+        raise EOFError("gzip 解压失败")
+    total, exceptions, unstacked, unknown, read_bytes = 0, 0, 0, 0, 0
+    rows = []
+    for line in output.decode("utf-8", "replace").splitlines():
+        fields = line.split("\t")
+        if fields[0] == "T" and len(fields) == 6:
+            total, exceptions, unstacked, unknown, read_bytes = (int(value) for value in fields[1:])
+        elif fields[0] == "G" and len(fields) == 9:
+            rows.append(fields[1:])
+    return total, exceptions, unstacked, unknown, read_bytes, rows
+
+
+def exception_stats(directories, runtime):
+    """Count entries and aggregate exception stacks in [since, until); awk does the grouping."""
+    request = runtime.request
+    since = parse_time(request.get("since"))
+    until = parse_time(request.get("until"))
+    include_unknown_time = request.get("include_unknown_time", False)
+    include_archives = request.get("include_archives", True)
+    top = request.get("top", 10)
+    total_entries = 0
+    exception_entries = 0
+    unstacked = 0
+    groups = {}
+    listed = list(discover(directories, runtime))
+    if (since is not None or until is not None) and request.get("filter_file_dates", True):
+        listed = family_prune(listed, since, until, runtime)
+    for path, directory in listed:
+        started = time.monotonic()
+        try:
+            kind = file_kind(path)
+        except OSError as exc:
+            runtime.unreadable(path)
+            runtime.warning("read_error", str(exc), path)
+            continue
+        if kind == "unsupported":
+            runtime.increment("unsupported_files")
+            runtime.warning("unsupported", "仅支持普通文件和 gzip", path)
+            continue
+        if kind == "gzip" and not include_archives:
+            continue
+        day = filename_day(path)
+        if request.get("filter_file_dates", True) and day_excluded(day, since, until):
+            runtime.increment("skipped_time_files")
+            runtime.phase("prefilter", path, started, filename_date=day.strftime("%Y-%m-%d"),
+                          decision="exclude", reason="filename_day_outside_window", bytes_read=0)
+            continue
+        try:
+            before = identity(path)
+        except OSError as exc:
+            runtime.unreadable(path)
+            runtime.warning("read_error", str(exc), path)
+            continue
+        try:
+            total, exceptions, silent, unknown, read_bytes, rows = scan_exceptions(path, kind, runtime, since, until)
+        except (OSError, EOFError, ValueError) as exc:
+            runtime.unreadable(path)
+            runtime.warning("read_error", str(exc), path)
+            continue
+        runtime.increment("bytes_read", read_bytes)
+        runtime.increment("time_unknown", unknown)
+        total_entries += total
+        exception_entries += exceptions
+        unstacked += silent
+        for count, first, end_time, start_line, end_line, sample_time, exception_type, frames in rows:
+            key_frames = [name for name in frames.split(",") if name]
+            key = exception_type + "|" + ",".join(key_frames)
+            group = groups.get(key)
+            if group is None:
+                groups[key] = group = dict(
+                    exception_type=exception_type, key_frames=key_frames, count=0,
+                    first_seen=None, last_seen=None, sample=None, _first=None, _last=None)
+            group["count"] += int(count)
+            stamp = parse_time(first)
+            if stamp is not None and (group["_first"] is None or stamp < group["_first"]):
+                group["_first"] = stamp
+                group["first_seen"] = stamp.isoformat(" ")
+            stamp = parse_time(end_time)
+            if stamp is not None and (group["_last"] is None or stamp > group["_last"]):
+                group["_last"] = stamp
+                group["last_seen"] = stamp.isoformat(" ")
+            if group["sample"] is None:
+                stamp = parse_time(sample_time)
+                group["sample"] = dict(ts=stamp.isoformat(" ") if stamp else None,
+                                       file=display_path(path, runtime),
+                                       start_line=int(start_line), end_line=int(end_line))
+        runtime.increment("scanned")
+        try:
+            if before != identity(path):
+                runtime.increment("source_changed")
+                runtime.warning("source_changed", "扫描期间日志发生变化", path)
+        except OSError:
+            pass
+    ordered = sorted(groups.values(), key=lambda g: (-g["count"], g["exception_type"], ",".join(g["key_frames"])))
+    result_groups = [{k: v for k, v in g.items() if not k.startswith("_")} for g in ordered[:top]]
+    runtime.emit("exception_stats",
+                 total_entries=total_entries,
+                 exception_entries=exception_entries,
+                 exception_rate=round(exception_entries / total_entries, 6) if total_entries else 0.0,
+                 unstacked_exceptions=unstacked,
+                 grouped_exceptions=exception_entries - unstacked,
+                 groups_total=len(groups),
+                 top=top,
+                 groups=result_groups,
+                 since=request.get("since"), until=request.get("until"),
+                 include_unknown_time=include_unknown_time)
+
+
 def execute(request, emit, cancelled=None):
     runtime = Runtime(request, emit, cancelled)
     try:
@@ -1310,17 +1602,21 @@ def execute(request, emit, cancelled=None):
         directories = log_directories(request["scope"], runtime)
         if not directories:
             raise ValueError("未找到日志目录")
-        if not shutil.which("rg") and request.get("action", "search") != "logs":
+        if not shutil.which("rg") and request.get("action", "search") not in ("logs", "exception-stats"):
             raise ValueError("缺少 rg，请在查询目标安装 ripgrep")
         if request.get("action", "search") != "logs" and request.get("include_archives", True) and not shutil.which("gzip"):
             raise ValueError("缺少 gzip，请在查询目标安装 gzip 或使用 --no-archives")
-        runtime.emit("ready", protocol_version=PROTOCOL, helper_version=VERSION, worker_pid=os.getpid(), source_hostname=socket.gethostname(), capabilities=dict(gzip=True, rg=True, python=sys.version.split()[0]), directories=[str(path) for path in directories])
+        if request.get("action") == "exception-stats" and not shutil.which("awk"):
+            raise ValueError("缺少 awk，请在查询目标安装 awk（gawk/mawk 均可）")
+        runtime.emit("ready", protocol_version=PROTOCOL, helper_version=VERSION, worker_pid=os.getpid(), source_hostname=socket.gethostname(), capabilities=dict(gzip=True, rg=True, awk=bool(shutil.which("awk")), python=sys.version.split()[0]), directories=[str(path) for path in directories])
         if request.get("action", "search") == "search":
             run_search(directories, runtime)
         elif request["action"] == "context":
             context(directories, runtime)
         elif request["action"] == "logs":
             list_logs(directories, runtime)
+        elif request["action"] == "exception-stats":
+            exception_stats(directories, runtime)
     except Stopped:
         if runtime.cancelled.is_set():
             runtime.outcome = "cancelled"
@@ -1333,7 +1629,7 @@ def execute(request, emit, cancelled=None):
     complete = runtime.outcome == "completed" and not any(counts[key] for key in ("unreadable_files", "unsupported_files", "source_changed", "skipped_links"))
     action = request.get("action", "search")
     filtered = action == "search" and request.get("filter_file_dates", True)
-    scope_basis = "selected_files_after_filename_date_filter" if filtered else "all_discovered_files" if action == "search" else "context_file" if action == "context" else "log_directory_listing" if action == "logs" else "directory_check"
+    scope_basis = "selected_files_after_filename_date_filter" if filtered else "all_discovered_files" if action in ("search", "exception-stats") else "context_file" if action == "context" else "log_directory_listing" if action == "logs" else "directory_check"
     runtime.emit("done", outcome=runtime.outcome, scope_complete=complete, scope_basis=scope_basis, filter_file_dates=filtered, result_mode=request.get("result_mode", "lines"), concurrency=request.get("concurrency", 2), content_complete=not bool(counts["truncated_entries"]), elapsed=round(time.monotonic() - runtime.started, 3), **counts)
 
 

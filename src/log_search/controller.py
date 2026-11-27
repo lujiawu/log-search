@@ -113,7 +113,7 @@ class Task:
                 if event.get("protocol") != 1 or event.get("task_id") != self.request["task_id"] or event.get("request_id") != self.request["request_id"] or event.get("seq") != sequence + 1:
                     raise ValueError("worker 协议或事件顺序不匹配")
                 sequence += 1
-                if event.get("type") not in ("ready", "progress", "phase", "logs", "warning", "entry", "context", "done"):
+                if event.get("type") not in ("ready", "progress", "phase", "logs", "warning", "entry", "context", "exception_stats", "done"):
                     raise ValueError("未知 worker 事件")
                 if event["type"] == "entry":
                     self.payload_bytes += len(raw)

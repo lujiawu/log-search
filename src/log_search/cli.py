@@ -37,7 +37,7 @@ def parser():
     diagnostics.add_argument("--session-id")
     diagnostics.add_argument("--task-id")
     diagnostics.add_argument("--format", choices=("text", "jsonl"), default="text")
-    for name, help_text in (("search", "搜索 traceId / 字面量"), ("context", "读取指定行所属条目和相邻上下文"), ("check", "检查目标能力和日志目录"), ("logs", "列出部署根目录下的服务日志目录")):
+    for name, help_text in (("search", "搜索 traceId / 字面量"), ("context", "读取指定行所属条目和相邻上下文"), ("check", "检查目标能力和日志目录"), ("logs", "列出部署根目录下的服务日志目录"), ("exception-stats", "异常统计与堆栈聚合，输出 JSONL/文本")):
         command = commands.add_parser(name, help=help_text)
         target = command.add_mutually_exclusive_group(required=True)
         target.add_argument("--local", action="store_true")
@@ -47,7 +47,7 @@ def parser():
         scope.add_argument("--log-dir", action="append", help="指定日志目录，可重复")
         command.add_argument("--ssh-config")
         command.add_argument("--interactive-auth", action="store_true", help="通过真实终端完成 SSH 密码或首次主机确认")
-        command.add_argument("--timeout", type=float, default=60 if name == "search" else 15)
+        command.add_argument("--timeout", type=float, default=600 if name == "exception-stats" else 60 if name == "search" else 15)
         command.add_argument("--format", choices=("text", "jsonl"), default="text")
         if name == "search":
             command.add_argument("--query", required=True)
@@ -66,6 +66,12 @@ def parser():
         elif name == "context":
             command.add_argument("--file", required=True)
             command.add_argument("--line", type=int, required=True)
+        elif name == "exception-stats":
+            command.add_argument("--since")
+            command.add_argument("--until")
+            command.add_argument("--no-archives", action="store_true")
+            command.add_argument("--include-unknown-time", action="store_true")
+            command.add_argument("--top", type=int, default=10, help="堆栈聚合输出 Top N，默认 10")
     tui = commands.add_parser("tui", help="启动 Textual 交互界面")
     tui.add_argument("--ssh-config")
     tui.add_argument("--root")
@@ -101,6 +107,7 @@ async def run(args):
         diagnostic.print(Text("操作日志不可用：" + controller.operations.error, style="yellow"))
     task = None
     scope_directories = []
+    stats = None
     loop = asyncio.get_running_loop()
     try:
         if args.interactive_auth and args.host:
@@ -108,6 +115,8 @@ async def run(args):
         extra = dict(file=args.file, line=args.line) if args.command == "context" else {}
         if args.command == "search":
             extra.update(filter_file_dates=not args.all_file_dates, result_mode=args.result_mode, concurrency=args.concurrency, expand_pattern=args.expand_pattern, auto_expand_exceptions=not args.no_exception_expansion)
+        elif args.command == "exception-stats":
+            extra.update(top=args.top)
         value = request(args.command, host=args.host, root=args.root, log_dirs=args.log_dir, query=getattr(args, "query", ""), since=getattr(args, "since", None), until=getattr(args, "until", None), include_archives=not getattr(args, "no_archives", False), include_unknown_time=getattr(args, "include_unknown_time", False), max_entries=getattr(args, "max_entries", 100), timeout=args.timeout, **extra)
         task = await controller.start(value, args.host)
         loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(task.cancel()))
@@ -130,11 +139,23 @@ async def run(args):
                     diagnostic.print("来源文件已变化", style="yellow")
                 for entry in event["entries"]:
                     display_entry(console, entry)
+            elif event["type"] == "exception_stats":
+                stats = event
+        if args.format == "text" and args.command == "exception-stats" and stats is not None:
+            console.print(Text("总条目 {} · 异常 {} · 率 {:.2%} · 无堆栈 {} · 堆栈聚合 {} 组（显示 Top {}）".format(
+                stats["total_entries"], stats["exception_entries"], stats["exception_rate"], stats["unstacked_exceptions"], stats["groups_total"], stats["top"])))
+            for group in stats["groups"]:
+                sample = group["sample"] or {}
+                console.print(Text("{}× {}  {}".format(group["count"], group["exception_type"], " ".join(group["key_frames"]))))
+                console.print(Text("  {} → {}:{}".format(sample.get("ts") or "时间未知", sample.get("file"), sample.get("start_line"))))
         if args.format == "text":
             for entry in sorted(task.entries, key=sort_key):
                 display_entry(console, entry)
             done = task.done or {}
-            diagnostic.print(Text("{} · {} 条目 · 范围{} · {}s".format(done.get("outcome", "failed"), done.get("entries", 0), "读取完整" if done.get("scope_complete") else "不完整", done.get("elapsed", "?"))))
+            if args.command == "exception-stats":
+                diagnostic.print(Text("{} · 扫描 {} 文件 · 读取 {} MiB · {}s".format(done.get("outcome", "failed"), done.get("scanned", 0), round(done.get("bytes_read", 0) / 1048576, 1), done.get("elapsed", "?"))))
+            else:
+                diagnostic.print(Text("{} · {} 条目 · 范围{} · {}s".format(done.get("outcome", "failed"), done.get("entries", 0), "读取完整" if done.get("scope_complete") else "不完整", done.get("elapsed", "?"))))
             if args.command == "search" and scope_directories:
                 shown = "、".join(scope_directories[:3]) + ("…共 {} 个".format(len(scope_directories)) if len(scope_directories) > 3 else "")
                 diagnostic.print(Text("扫描范围：{} · 发现 {} 文件 · 实际读取 {} MiB · 跳过符号链接 {}".format(shown, done.get("discovered", 0), round(done.get("bytes_read", 0) / 1048576, 1), done.get("skipped_links", 0))))
@@ -165,7 +186,7 @@ async def run(args):
         await controller.close()
 
 
-COMMANDS = ("search", "context", "check", "logs", "hosts", "diagnostics", "tui")
+COMMANDS = ("search", "context", "check", "logs", "exception-stats", "hosts", "diagnostics", "tui")
 
 
 def expand(argv):
