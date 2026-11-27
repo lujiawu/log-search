@@ -51,6 +51,25 @@ def test_exception_stats_counts_and_stack_aggregation(tmp_path):
     assert events[-1]["type"] == "done" and events[-1]["outcome"] == "completed"
 
 
+def test_exception_stats_root_scope_accepts_any_subdirectory(tmp_path):
+    logs = tmp_path / "deploy" / "svc" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "app.log").write_text(LOG)
+    root = str(tmp_path / "deploy")
+    for directory in ("svc", "svc/logs"):
+        events = []
+        worker.execute(dict(protocol=1, action="exception-stats",
+                            scope={"root": root, "log_dirs": [str(tmp_path / "deploy" / directory)]}), events.append)
+        stats = [event for event in events if event["type"] == "exception_stats"][0]
+        assert (stats["total_entries"], stats["exception_entries"]) == (5, 3)
+    # 越出 root 的目录在 validate 阶段被拒
+    events = []
+    worker.execute(dict(protocol=1, action="exception-stats",
+                        scope={"root": root, "log_dirs": [str(tmp_path)]}), events.append)
+    assert events[-1]["outcome"] == "failed"
+    assert not any(event["type"] == "exception_stats" for event in events)
+
+
 def test_exception_stats_tab_indented_stack(tmp_path):
     (tmp_path / "app.log").write_text(
         "2026-01-01 10:00:00 ERROR java.lang.IllegalStateException: x\n"

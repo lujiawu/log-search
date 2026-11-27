@@ -164,7 +164,7 @@ class LogSearchApp(App):
     #status.partial { color: $warning; }
     #key-hints { height: 1; width: auto; color: $text-muted; padding: 0 1; }
     """
-    BINDINGS = [Binding("ctrl+c", "interrupt", "取消 / 复制", priority=True), Binding("ctrl+f", "query", "查询", priority=True), Binding("ctrl+d", "pick_dir", "选择目录", priority=True), Binding("q", "quit", "退出"), Binding("r", "search", "重查"), Binding("e", "stats", "异常统计"), Binding("x", "cancel", "取消")]
+    BINDINGS = [Binding("ctrl+c", "interrupt", "取消 / 复制", priority=True), Binding("ctrl+f", "query", "查询", priority=True), Binding("ctrl+d", "pick_dir", "选择目录", priority=True), Binding("q", "quit", "退出"), Binding("r", "search", "重查"), Binding("x", "cancel", "取消")]
 
     def __init__(self, ssh_config=None, root=None, host=None):
         super().__init__()
@@ -225,7 +225,7 @@ class LogSearchApp(App):
         yield LogTable(id="results", cursor_type="row", show_header=False, show_row_labels=False, zebra_stripes=False)
         with Horizontal(id="status-line"):
             yield Static(self.status_text, id="status", markup=False)
-            yield Static("e 统计 · q 退出", id="key-hints", markup=False)
+            yield Static("q 退出", id="key-hints", markup=False)
 
     def on_mount(self):
         self.query_one("#results", DataTable).add_columns(*SEARCH_COLUMNS)

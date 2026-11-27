@@ -297,7 +297,8 @@ async def test_stats_table_and_full_stack_detail(tmp_path, monkeypatch):
     async with app.run_test(size=(120, 36)) as pilot:
         table = app.query_one("#results", DataTable)
         table.focus()
-        await pilot.press("e")
+        await pilot.click("#tab-stats")
+        await pilot.press("enter")
         await wait_finished(pilot, app)
         assert app.mode == "stats" and app.stats["exception_entries"] == 1
         for _ in range(20):

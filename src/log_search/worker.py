@@ -310,11 +310,14 @@ def log_directories(scope, runtime):
             elif service.is_dir() and logs.is_dir():
                 result.append(logs)
         if scope.get("log_dirs"):
-            wanted = set(scope["log_dirs"])
-            selected = [path for path in result if str(path) in wanted]
-            missing = sorted(wanted - {str(path) for path in selected})
-            if missing:
-                raise ValueError("所选日志目录已不存在于部署根目录: " + "、".join(missing))
+            # 任意子目录都可指（不限于 <service>/logs）；存在性、绝对路径、
+            # 是否位于 root 内由 validate() 与这里的目录/符号链接检查兜住。
+            selected = []
+            for name in scope["log_dirs"]:
+                path = Path(name)
+                if not no_links(path) or not path.is_dir():
+                    raise ValueError("所选日志目录不存在或包含符号链接: " + str(path))
+                selected.append(path)
             result = selected
     else:
         result = []
